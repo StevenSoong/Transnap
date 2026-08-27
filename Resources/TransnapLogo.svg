@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Transnap 闪译</title>
+  <desc id="desc">A minimal cobalt speech shape with a lightning-bolt cutout.</desc>
+  <path
+    fill="#2563EB"
+    fill-rule="evenodd"
+    d="
+      M240 144
+      H784
+      C851 144 896 189 896 256
+      V632
+      C896 699 851 744 784 744
+      H548
+      L330 880
+      L384 744
+      H240
+      C173 744 128 699 128 632
+      V256
+      C128 189 173 144 240 144
+      Z
+
+      M570 240
+      L358 516
+      H493
+      L438 682
+      L674 392
+      H538
+      Z
+    "
+  />
+</svg>

@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Build artifacts
+dist/
+*.dSYM/
+
+# Xcode user data
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.key
+credentials.json
+
+# Editor settings
+.idea/
+.vscode/
+*.swp
