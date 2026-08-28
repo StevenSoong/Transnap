@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var settingsController: SettingsWindowController!
     private var monitor: TranslationShortcutMonitor!
+    private var lastAccessibilityTrusted: Bool?
     private var translationTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -34,11 +35,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        if CommandLine.arguments.contains("--settings-preview") {
+        if CommandLine.arguments.contains("--settings-preview")
+            || CommandLine.arguments.contains("--settings-preview-untrusted") {
             NSApplication.shared.setActivationPolicy(.regular)
+            let forceUntrusted = CommandLine.arguments.contains("--settings-preview-untrusted")
             settingsController = SettingsWindowController(
                 settings: settings,
                 credentials: credentials,
+                accessibilityTrustProvider: forceUntrusted ? { false } : { AXIsProcessTrusted() },
                 onShortcutChanged: { _ in }
             )
             settingsController.present()
@@ -90,7 +94,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         credentials.importEnvironmentKeyIfNeeded()
         settingsController = SettingsWindowController(
             settings: settings,
-            credentials: credentials
+            credentials: credentials,
+            onAccessibilityChanged: { [weak self] trusted in
+                self?.reconcileAccessibilityAuthorization(trusted: trusted)
+            }
         ) { [weak self] shortcut in
             self?.monitor?.updateShortcut(shortcut)
         }
@@ -100,17 +107,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         monitor = TranslationShortcutMonitor(shortcut: settings.keyboardShortcut) { [weak self] point in
             self?.translateSelection(at: point)
         }
-        monitor.start()
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(workspaceApplicationDidActivate(_:)),
+            name: NSWorkspace.didActivateApplicationNotification,
+            object: nil
+        )
+        reconcileAccessibilityAuthorization(trusted: AXIsProcessTrusted())
 
         if !AXIsProcessTrusted() || credentials.loadAPIKey() == nil {
             settingsController.present()
-            if !AXIsProcessTrusted() { requestAccessibilityPermission() }
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         translationTask?.cancel()
         monitor?.stop()
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
         if let statusItem {
             NSStatusBar.system.removeStatusItem(statusItem)
         }
@@ -171,9 +184,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func requestAccessibilityPermission() {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
+    @objc private func workspaceApplicationDidActivate(_ notification: Notification) {
+        reconcileAccessibilityAuthorization(trusted: AXIsProcessTrusted())
+    }
+
+    private func reconcileAccessibilityAuthorization(trusted: Bool) {
+        let action = AccessibilityShortcutMonitorTransition.action(
+            previous: lastAccessibilityTrusted,
+            current: trusted
+        )
+        lastAccessibilityTrusted = trusted
+
+        switch action {
+        case .none:
+            break
+        case .stop:
+            monitor?.stop()
+        case .restart:
+            monitor?.stop()
+            monitor?.start()
+        }
     }
 
     @objc func translateFromMenuBar() {

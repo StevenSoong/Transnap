@@ -68,6 +68,8 @@ final class SettingsWindowController: NSWindowController,
 
     private let settings: AppSettings
     private let credentials: CredentialStore
+    private let accessibilityTrustProvider: () -> Bool
+    private let onAccessibilityChanged: (Bool) -> Void
     private let onShortcutChanged: (KeyboardShortcut) -> Void
 
     private let sidebarTable = NSTableView()
@@ -77,9 +79,17 @@ final class SettingsWindowController: NSWindowController,
     private var isLoadingValues = false
 
     private let shortcutRecorder = ShortcutRecorderButton()
+    private let permissionStatusIcon = NSImageView()
     private let permissionStatusLabel = NSTextField(labelWithString: "")
+    private let permissionInstructionLabel = NSTextField(labelWithString: "")
     private let permissionButton = NSButton()
+    private let permissionDragView = ApplicationBundleDragView(
+        applicationURL: AccessibilityDragPayload.applicationBundleURL(from: Bundle.main.bundleURL)
+    )
     private let saveHistorySwitch = NSSwitch()
+    private var permissionPhase = AccessibilityAuthorizationPhase.idle
+    private var lastPermissionTrusted: Bool?
+    private var permissionPollTimer: Timer?
 
     private let targetPopup = NSPopUpButton()
     private let streamSwitch = NSSwitch()
@@ -95,10 +105,14 @@ final class SettingsWindowController: NSWindowController,
     init(
         settings: AppSettings,
         credentials: CredentialStore,
+        accessibilityTrustProvider: @escaping () -> Bool = { AXIsProcessTrusted() },
+        onAccessibilityChanged: @escaping (Bool) -> Void = { _ in },
         onShortcutChanged: @escaping (KeyboardShortcut) -> Void
     ) {
         self.settings = settings
         self.credentials = credentials
+        self.accessibilityTrustProvider = accessibilityTrustProvider
+        self.onAccessibilityChanged = onAccessibilityChanged
         self.onShortcutChanged = onShortcutChanged
 
         let window = NSWindow(
@@ -114,6 +128,12 @@ final class SettingsWindowController: NSWindowController,
 
         super.init(window: window)
         window.delegate = self
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidBecomeActive(_:)),
+            name: NSApplication.didBecomeActiveNotification,
+            object: nil
+        )
         buildUI(in: window)
         configureActions()
         loadValues()
@@ -122,12 +142,18 @@ final class SettingsWindowController: NSWindowController,
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    deinit {
+        permissionPollTimer?.invalidate()
+        NotificationCenter.default.removeObserver(self)
+    }
+
     func present() {
         loadValues()
         showSection(selectedSection)
         NSApplication.shared.activate(ignoringOtherApps: true)
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
+        startPermissionPolling()
     }
 
     func presentModelPage() {
@@ -252,22 +278,11 @@ final class SettingsWindowController: NSWindowController,
         shortcutRecorder.controlSize = .regular
         shortcutRecorder.widthAnchor.constraint(equalToConstant: 150).isActive = true
 
-        permissionStatusLabel.font = .systemFont(ofSize: 11.5)
-        permissionStatusLabel.setContentHuggingPriority(.required, for: .horizontal)
-        permissionButton.title = "设置…"
-        permissionButton.bezelStyle = .rounded
-        permissionButton.controlSize = .small
-
-        let permissionControls = NSStackView(views: [permissionStatusLabel, permissionButton])
-        permissionControls.orientation = .horizontal
-        permissionControls.alignment = .centerY
-        permissionControls.spacing = 9
-
         configureSwitch(saveHistorySwitch)
 
         let basics = settingsGroup([
             settingRow(title: "翻译快捷键", control: shortcutRecorder),
-            settingRow(title: "辅助功能", control: permissionControls),
+            makeAccessibilityPermissionRow(),
         ])
         let records = settingsGroup([
             settingRow(
@@ -284,6 +299,83 @@ final class SettingsWindowController: NSWindowController,
                 sectionBlock(title: "记录", body: records),
             ]
         )
+    }
+
+    private func makeAccessibilityPermissionRow() -> NSView {
+        let row = NSView()
+
+        let titleLabel = NSTextField(labelWithString: "辅助功能")
+        titleLabel.font = .systemFont(ofSize: 12.5)
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let subtitleLabel = NSTextField(labelWithString: "闪译仅使用此权限读取其他 App 中选中的文字。")
+        subtitleLabel.font = .systemFont(ofSize: 10.5)
+        subtitleLabel.textColor = .secondaryLabelColor
+        subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        permissionStatusIcon.imageScaling = .scaleProportionallyDown
+        permissionStatusIcon.translatesAutoresizingMaskIntoConstraints = false
+        permissionStatusIcon.widthAnchor.constraint(equalToConstant: 15).isActive = true
+        permissionStatusIcon.heightAnchor.constraint(equalToConstant: 15).isActive = true
+
+        permissionStatusLabel.font = .systemFont(ofSize: 11.5, weight: .medium)
+        permissionStatusLabel.setContentHuggingPriority(.required, for: .horizontal)
+        permissionStatusLabel.setAccessibilityLabel("辅助功能权限状态")
+
+        let statusStack = NSStackView(views: [permissionStatusIcon, permissionStatusLabel])
+        statusStack.orientation = .horizontal
+        statusStack.alignment = .centerY
+        statusStack.spacing = 5
+
+        permissionButton.bezelStyle = .rounded
+        permissionButton.controlSize = .small
+
+        let headerControls = NSStackView(views: [statusStack, permissionButton])
+        headerControls.orientation = .horizontal
+        headerControls.alignment = .centerY
+        headerControls.spacing = 9
+        headerControls.translatesAutoresizingMaskIntoConstraints = false
+        headerControls.setContentHuggingPriority(.required, for: .horizontal)
+        headerControls.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        permissionDragView.translatesAutoresizingMaskIntoConstraints = false
+        permissionDragView.widthAnchor.constraint(equalToConstant: 44).isActive = true
+        permissionDragView.heightAnchor.constraint(equalToConstant: 44).isActive = true
+
+        permissionInstructionLabel.font = .systemFont(ofSize: 10.5)
+        permissionInstructionLabel.textColor = .secondaryLabelColor
+        permissionInstructionLabel.lineBreakMode = .byWordWrapping
+        permissionInstructionLabel.maximumNumberOfLines = 2
+        permissionInstructionLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let instructionStack = NSStackView(views: [permissionDragView, permissionInstructionLabel])
+        instructionStack.orientation = .horizontal
+        instructionStack.alignment = .centerY
+        instructionStack.spacing = 10
+        instructionStack.translatesAutoresizingMaskIntoConstraints = false
+
+        row.addSubview(titleLabel)
+        row.addSubview(subtitleLabel)
+        row.addSubview(headerControls)
+        row.addSubview(instructionStack)
+        NSLayoutConstraint.activate([
+            titleLabel.topAnchor.constraint(equalTo: row.topAnchor, constant: 10),
+            titleLabel.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 14),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: headerControls.leadingAnchor, constant: -12),
+
+            headerControls.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -13),
+            headerControls.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+
+            subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
+            subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            subtitleLabel.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor, constant: -14),
+
+            instructionStack.topAnchor.constraint(equalTo: subtitleLabel.bottomAnchor, constant: 9),
+            instructionStack.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            instructionStack.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -14),
+            instructionStack.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -10),
+        ])
+        return row
     }
 
     private func makeTranslationPage() -> NSView {
@@ -622,6 +714,17 @@ final class SettingsWindowController: NSWindowController,
 
         permissionButton.target = self
         permissionButton.action = #selector(requestAccessibility)
+        permissionDragView.onDragBegan = { [weak self] in
+            guard let self else { return }
+            self.permissionPhase = .dragging
+            self.updatePermissionStatus()
+            self.openAccessibilitySettings()
+        }
+        permissionDragView.onDragEnded = { [weak self] wasAccepted in
+            guard let self else { return }
+            self.permissionPhase = wasAccepted ? .dropped : .idle
+            self.updatePermissionStatus()
+        }
 
         saveHistorySwitch.target = self
         saveHistorySwitch.action = #selector(saveHistoryChanged)
@@ -667,10 +770,41 @@ final class SettingsWindowController: NSWindowController,
     }
 
     private func updatePermissionStatus() {
-        let trusted = AXIsProcessTrusted()
-        permissionStatusLabel.stringValue = trusted ? "已授权" : "未授权"
-        permissionStatusLabel.textColor = trusted ? .systemGreen : .secondaryLabelColor
-        permissionButton.title = trusted ? "查看…" : "设置…"
+        let trusted = accessibilityTrustProvider()
+        if trusted {
+            permissionPhase = .idle
+        }
+        let presentation = AccessibilityAuthorizationPresentation.make(
+            isTrusted: trusted,
+            canDragApplication: permissionDragView.applicationURL != nil,
+            phase: permissionPhase
+        )
+
+        permissionStatusIcon.image = NSImage(
+            systemSymbolName: presentation.symbolName,
+            accessibilityDescription: presentation.statusText
+        )
+        permissionStatusIcon.contentTintColor = trusted
+            ? .systemGreen
+            : permissionPhase == .dropped ? .systemOrange : .secondaryLabelColor
+        permissionStatusLabel.stringValue = presentation.statusText
+        permissionStatusLabel.textColor = trusted
+            ? .systemGreen
+            : permissionPhase == .dropped ? .systemOrange : .secondaryLabelColor
+        permissionStatusLabel.setAccessibilityValue(presentation.statusText)
+        permissionInstructionLabel.stringValue = presentation.instructionText
+        permissionInstructionLabel.setAccessibilityLabel(presentation.instructionText)
+        permissionButton.title = presentation.buttonTitle
+        permissionButton.setAccessibilityLabel(
+            trusted ? "查看辅助功能设置" : "打开辅助功能设置"
+        )
+        permissionDragView.isHidden = !presentation.showsDragSource
+
+        let didChange = lastPermissionTrusted.map { $0 != trusted } ?? false
+        lastPermissionTrusted = trusted
+        if didChange {
+            onAccessibilityChanged(trusted)
+        }
     }
 
     private func persistEditableValues() {
@@ -784,8 +918,47 @@ final class SettingsWindowController: NSWindowController,
         persistPrompt(showFeedback: true)
     }
 
+    func windowDidBecomeKey(_ notification: Notification) {
+        updatePermissionStatus()
+        startPermissionPolling()
+    }
+
     func windowWillClose(_ notification: Notification) {
+        stopPermissionPolling()
+        permissionPhase = .idle
         persistEditableValues()
+    }
+
+    @objc private func applicationDidBecomeActive(_ notification: Notification) {
+        guard window?.isVisible == true else { return }
+        updatePermissionStatus()
+        startPermissionPolling()
+    }
+
+    private func startPermissionPolling() {
+        guard permissionPollTimer == nil, window?.isVisible == true else { return }
+        let timer = Timer(
+            timeInterval: 0.75,
+            target: self,
+            selector: #selector(pollAccessibilityPermission),
+            userInfo: nil,
+            repeats: true
+        )
+        RunLoop.main.add(timer, forMode: .common)
+        permissionPollTimer = timer
+    }
+
+    private func stopPermissionPolling() {
+        permissionPollTimer?.invalidate()
+        permissionPollTimer = nil
+    }
+
+    @objc private func pollAccessibilityPermission() {
+        guard window?.isVisible == true else {
+            stopPermissionPolling()
+            return
+        }
+        updatePermissionStatus()
     }
 
     private func sidebarImage(for section: Section) -> NSImage? {
@@ -796,17 +969,17 @@ final class SettingsWindowController: NSWindowController,
     }
 
     @objc private func requestAccessibility() {
-        if AXIsProcessTrusted(),
-           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-        {
-            NSWorkspace.shared.open(url)
-        } else {
-            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-            _ = AXIsProcessTrustedWithOptions(options)
+        openAccessibilitySettings()
+        updatePermissionStatus()
+    }
+
+    private func openAccessibilitySettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        ) else {
+            return
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            self?.updatePermissionStatus()
-        }
+        NSWorkspace.shared.open(url)
     }
 
     @objc private func saveHistoryChanged() {

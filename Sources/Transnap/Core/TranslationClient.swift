@@ -21,6 +21,18 @@ enum TranslationError: LocalizedError {
 final class TranslationClient {
     typealias DeltaHandler = @MainActor (String) -> Void
 
+    private static let fixedSamplingKimiModelIDs: Set<String> = [
+        "kimi-k3",
+        "k3",
+        "k3-256k",
+        "kimi-for-coding",
+        "kimi-for-coding-highspeed",
+        "kimi-k2.5",
+        "kimi-k2.6",
+        "kimi-k2.7-code",
+        "kimi-k2.7-code-highspeed",
+    ]
+
     private let session: URLSession
 
     init(session: URLSession? = nil) {
@@ -112,11 +124,25 @@ final class TranslationClient {
             "temperature": 0,
             "max_tokens": 2_048,
         ]
+        if shouldOmitTemperature(model: settings.model, baseURL: settings.baseURL) {
+            body.removeValue(forKey: "temperature")
+        }
         if settings.model.lowercased().hasPrefix("glm-") {
             body["thinking_budget"] = 1_024
             body["chat_template_kwargs"] = ["enable_thinking": false]
         }
         return body
+    }
+
+    static func shouldOmitTemperature(model: String, baseURL: String) -> Bool {
+        let normalizedModel = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if fixedSamplingKimiModelIDs.contains(normalizedModel) {
+            return true
+        }
+
+        guard let endpoint = try? endpoint(from: baseURL) else { return false }
+        return endpoint.host?.lowercased() == "api.kimi.com"
+            && endpoint.path.lowercased().hasPrefix("/coding/")
     }
 
     static func contentDelta(from sseData: String) throws -> String {
