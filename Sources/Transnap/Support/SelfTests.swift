@@ -43,6 +43,7 @@ enum SelfTests {
         )
         let body = TranslationClient.requestBody(text: "Hello", settings: settings)
         try expect(body["model"] as? String == "gpt-4o-mini", "请求模型名称错误")
+        try expect((body["temperature"] as? NSNumber)?.doubleValue == 0, "通用模型请求温度发生变化")
         try expect(body["chat_template_kwargs"] == nil, "通用模型请求携带了 GLM 专用字段")
         try expect(body["stream"] as? Bool == true, "翻译请求未启用流式响应")
         let messages = body["messages"] as? [[String: String]]
@@ -63,11 +64,126 @@ enum SelfTests {
             "GLM 翻译请求未关闭模型思考"
         )
 
+        for kimiModel in [
+            " KIMI-K3 ",
+            "k3",
+            "k3-256k",
+            "kimi-for-coding",
+            "kimi-for-coding-highspeed",
+            "kimi-k2.5",
+            "kimi-k2.6",
+            "kimi-k2.7-code",
+            "kimi-k2.7-code-highspeed",
+        ] {
+            let kimiSettings = AppSettingsSnapshot(
+                baseURL: "https://example.com/v1",
+                model: kimiModel,
+                targetLanguage: .simplifiedChinese,
+                translationPrompt: AppSettings.defaultTranslationPrompt
+            )
+            let kimiBody = TranslationClient.requestBody(text: "Hello", settings: kimiSettings)
+            try expect(
+                kimiBody["temperature"] == nil,
+                "Kimi Code 模型 \(kimiModel) 的翻译请求不应携带固定温度参数"
+            )
+        }
+        try expect(
+            TranslationClient.shouldOmitTemperature(
+                model: "future-kimi-code-model",
+                baseURL: "https://api.kimi.com/coding/v1"
+            ),
+            "Kimi Code 接口的新模型不应被强行覆盖温度参数"
+        )
+        try expect(
+            !TranslationClient.shouldOmitTemperature(
+                model: "gpt-4o-mini",
+                baseURL: "https://api.openai.com/v1"
+            ),
+            "非 Kimi Code 模型不应丢失温度参数"
+        )
+
         let shortcut = KeyboardShortcut(keyCode: 17, modifiers: [.control, .option], keyLabel: "T")
         try expect(shortcut.displayString == "⌃⌥T", "快捷键显示错误")
         try expect(shortcut.matches(keyCode: 17, modifiers: [.control, .option]), "正确快捷键未匹配")
         try expect(!shortcut.matches(keyCode: 17, modifiers: [.control, .option, .shift]), "额外修饰键不应匹配")
         try expect(!shortcut.matches(keyCode: 16, modifiers: [.control, .option]), "错误普通按键不应匹配")
+
+        let draggableAppURL = URL(fileURLWithPath: "/Applications/Transnap.app")
+        try expect(
+            AccessibilityDragPayload.applicationBundleURL(from: draggableAppURL) == draggableAppURL,
+            "辅助功能授权拖拽没有保留当前 app bundle URL"
+        )
+        try expect(
+            AccessibilityDragPayload.pasteboardItem(for: draggableAppURL)?
+                .string(forType: .fileURL) == draggableAppURL.absoluteString,
+            "辅助功能授权拖拽没有写入标准文件 URL"
+        )
+        try expect(
+            AccessibilityDragPayload.applicationBundleURL(
+                from: URL(fileURLWithPath: "/tmp/Transnap")
+            ) == nil,
+            "非 app 路径不应成为辅助功能授权拖拽载荷"
+        )
+        try expect(
+            AccessibilityDragPayload.applicationBundleURL(
+                from: URL(string: "https://example.com/Transnap.app")!
+            ) == nil,
+            "远程 URL 不应成为辅助功能授权拖拽载荷"
+        )
+
+        let unauthorizedPermission = AccessibilityAuthorizationPresentation.make(
+            isTrusted: false,
+            canDragApplication: true,
+            phase: .idle
+        )
+        try expect(unauthorizedPermission.statusText == "未授权", "未授权状态文案错误")
+        try expect(unauthorizedPermission.showsDragSource, "未授权时未显示 app 拖拽入口")
+        try expect(unauthorizedPermission.buttonTitle == "打开设置…", "未授权按钮文案错误")
+
+        let droppedPermission = AccessibilityAuthorizationPresentation.make(
+            isTrusted: false,
+            canDragApplication: true,
+            phase: .dropped
+        )
+        try expect(droppedPermission.statusText == "请确认", "拖放完成后的状态文案错误")
+        try expect(
+            droppedPermission.instructionText.contains("确认闪译已在列表"),
+            "拖放完成后没有提示用户在系统设置中确认"
+        )
+
+        let authorizedPermission = AccessibilityAuthorizationPresentation.make(
+            isTrusted: true,
+            canDragApplication: true,
+            phase: .dropped
+        )
+        try expect(authorizedPermission.statusText == "已授权", "已授权状态文案错误")
+        try expect(!authorizedPermission.showsDragSource, "已授权后仍显示 app 拖拽入口")
+        try expect(authorizedPermission.buttonTitle == "查看…", "已授权按钮文案错误")
+
+        let nonBundlePermission = AccessibilityAuthorizationPresentation.make(
+            isTrusted: false,
+            canDragApplication: false,
+            phase: .idle
+        )
+        try expect(!nonBundlePermission.showsDragSource, "非 app 运行时不应显示拖拽入口")
+        try expect(
+            nonBundlePermission.instructionText.contains("Transnap.app"),
+            "非 app 运行时没有显示安装指引"
+        )
+
+        var previousTrust: Bool?
+        let trustSequence = [false, false, true, true, false]
+        let monitorActions = trustSequence.map { trusted -> AccessibilityShortcutMonitorAction in
+            defer { previousTrust = trusted }
+            return AccessibilityShortcutMonitorTransition.action(
+                previous: previousTrust,
+                current: trusted
+            )
+        }
+        try expect(
+            monitorActions == [.stop, .none, .restart, .none, .stop],
+            "辅助功能权限变化会重复或遗漏快捷键监听更新"
+        )
 
         let suiteName = "com.codex.Transnap.SelfTests.\(UUID().uuidString)"
         guard let shortcutDefaults = UserDefaults(suiteName: suiteName) else {
