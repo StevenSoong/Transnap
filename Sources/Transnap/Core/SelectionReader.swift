@@ -4,7 +4,58 @@ import NaturalLanguage
 
 struct CapturedText {
     let text: String
+    let context: TranslationContext?
     let anchor: CGRect?
+}
+
+struct TranslationContext: Equatable {
+    let before: String
+    let after: String
+}
+
+enum SelectionContextPolicy {
+    static let maximumSelectionLength = 64
+    static let surroundingCharacterLimit = 240
+
+    static func shouldReadContext(for selection: String) -> Bool {
+        let trimmed = selection.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.count <= maximumSelectionLength,
+              trimmed == selection else { return false }
+        return !trimmed.unicodeScalars.contains { CharacterSet.whitespacesAndNewlines.contains($0) }
+    }
+
+    static func context(
+        in source: String,
+        selectionRange: NSRange,
+        selectedText: String
+    ) -> TranslationContext? {
+        guard shouldReadContext(for: selectedText) else { return nil }
+        let source = source as NSString
+        guard selectionRange.location >= 0,
+              selectionRange.length > 0,
+              selectionRange.location <= source.length,
+              selectionRange.length <= source.length - selectionRange.location else { return nil }
+        let selectedSlice = source.substring(with: selectionRange)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard selectedSlice == selectedText else { return nil }
+
+        let beforeStart = max(0, selectionRange.location - surroundingCharacterLimit)
+        let beforeRange = source.rangeOfComposedCharacterSequences(
+            for: NSRange(location: beforeStart, length: selectionRange.location - beforeStart)
+        )
+        let selectionEnd = NSMaxRange(selectionRange)
+        let afterEnd = min(source.length, selectionEnd + surroundingCharacterLimit)
+        let afterRange = source.rangeOfComposedCharacterSequences(
+            for: NSRange(location: selectionEnd, length: afterEnd - selectionEnd)
+        )
+        let before = source.substring(with: beforeRange)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let after = source.substring(with: afterRange)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !before.isEmpty || !after.isEmpty else { return nil }
+        return TranslationContext(before: before, after: after)
+    }
 }
 
 enum SelectionAnchorPolicy {
@@ -63,6 +114,7 @@ final class SelectionReader {
         if let selected = focusedSelection(), !selected.text.isEmpty {
             return CapturedText(
                 text: selected.text,
+                context: selected.context,
                 anchor: SelectionAnchorPolicy.resolve(
                     candidate: selected.anchor,
                     fallback: fallbackAnchor,
@@ -76,6 +128,7 @@ final class SelectionReader {
            !pointed.text.isEmpty {
             return CapturedText(
                 text: pointed.text,
+                context: pointed.context,
                 anchor: SelectionAnchorPolicy.resolve(
                     candidate: pointed.anchor,
                     fallback: fallbackAnchor,
@@ -95,9 +148,13 @@ final class SelectionReader {
         guard let rawText = copyAttribute(element, kAXSelectedTextAttribute as CFString) as? String else { return nil }
         let text = normalized(rawText)
         guard !text.isEmpty else { return nil }
-        let bounds = copyAttribute(element, kAXSelectedTextRangeAttribute as CFString)
-            .flatMap { rangeValue in boundsForRange(rangeValue, in: element) }
-        return CapturedText(text: text, anchor: bounds.map(axRectToAppKit))
+        let rawRange = copyAttribute(element, kAXSelectedTextRangeAttribute as CFString)
+        let selectedRange = rawRange.flatMap(cfRange)
+        let bounds = rawRange.flatMap { boundsForRange($0, in: element) }
+        let context = selectedRange.flatMap {
+            surroundingContext(for: text, selectionRange: $0, in: element)
+        }
+        return CapturedText(text: text, context: context, anchor: bounds.map(axRectToAppKit))
     }
 
     private func wordAtPoint(_ appKitPoint: CGPoint) -> CapturedText? {
@@ -125,7 +182,12 @@ final class SelectionReader {
         var selectedRange = CFRange(location: nsRange.location, length: nsRange.length)
         let bounds = AXValueCreate(.cfRange, &selectedRange)
             .flatMap { boundsForRange($0, in: element) }
-        return CapturedText(text: text, anchor: bounds.map(axRectToAppKit))
+        let context = SelectionContextPolicy.context(
+            in: value,
+            selectionRange: nsRange,
+            selectedText: text
+        )
+        return CapturedText(text: text, context: context, anchor: bounds.map(axRectToAppKit))
     }
 
     private func tokenRange(in text: String, utf16Offset: Int) -> Range<String.Index>? {
@@ -165,7 +227,43 @@ final class SelectionReader {
         guard let copied else { return nil }
         let text = normalized(copied)
         guard !text.isEmpty else { return nil }
-        return CapturedText(text: text, anchor: anchor)
+        return CapturedText(text: text, context: nil, anchor: anchor)
+    }
+
+    private func surroundingContext(
+        for selectedText: String,
+        selectionRange: CFRange,
+        in element: AXUIElement
+    ) -> TranslationContext? {
+        guard SelectionContextPolicy.shouldReadContext(for: selectedText) else { return nil }
+
+        if let value = copyAttribute(element, kAXValueAttribute as CFString) as? String,
+           let context = SelectionContextPolicy.context(
+               in: value,
+               selectionRange: NSRange(location: selectionRange.location, length: selectionRange.length),
+               selectedText: selectedText
+           ) {
+            return context
+        }
+
+        guard let count = (copyAttribute(element, kAXNumberOfCharactersAttribute as CFString) as? NSNumber)?.intValue,
+              selectionRange.location >= 0,
+              selectionRange.length > 0,
+              selectionRange.location <= count,
+              selectionRange.length <= count - selectionRange.location else { return nil }
+        let start = max(0, selectionRange.location - SelectionContextPolicy.surroundingCharacterLimit)
+        let selectionEnd = selectionRange.location + selectionRange.length
+        let end = min(count, selectionEnd + SelectionContextPolicy.surroundingCharacterLimit)
+        let expandedRange = CFRange(location: start, length: end - start)
+        guard let source = string(for: expandedRange, in: element) else { return nil }
+        return SelectionContextPolicy.context(
+            in: source,
+            selectionRange: NSRange(
+                location: selectionRange.location - start,
+                length: selectionRange.length
+            ),
+            selectedText: selectedText
+        )
     }
 
     private func normalized(_ text: String) -> String {
@@ -211,6 +309,16 @@ final class SelectionReader {
         guard AXValueGetType(value) == .cgRect else { return nil }
         var rect = CGRect.zero
         return AXValueGetValue(value, .cgRect, &rect) ? rect : nil
+    }
+
+    private func string(for range: CFRange, in element: AXUIElement) -> String? {
+        var range = range
+        guard let rangeValue = AXValueCreate(.cfRange, &range) else { return nil }
+        return copyParameterizedAttribute(
+            element,
+            kAXStringForRangeParameterizedAttribute as CFString,
+            rangeValue
+        ) as? String
     }
 
     private func focusedWindowFrame() -> CGRect? {

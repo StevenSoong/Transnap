@@ -150,6 +150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 let result = try await self.client.translate(
                     text: captured.text,
+                    context: captured.context,
                     apiKey: apiKey,
                     settings: self.settings.snapshot
                 ) { [weak self] partial in

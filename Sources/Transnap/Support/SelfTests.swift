@@ -51,6 +51,47 @@ enum SelfTests {
             "自定义翻译提示词或目标语言变量未生效"
         )
 
+        let contextualBody = TranslationClient.requestBody(
+            text: "bank",
+            context: TranslationContext(
+                before: "She deposited the cheque at the",
+                after: "before it closed."
+            ),
+            settings: settings
+        )
+        let contextualMessages = contextualBody["messages"] as? [[String: String]]
+        let contextualUserMessage = contextualMessages?.last?["content"] ?? ""
+        let contextualPayload = contextualUserMessage.data(using: .utf8).flatMap {
+            try? JSONSerialization.jsonObject(with: $0) as? [String: String]
+        }
+        try expect(contextualPayload?["text_to_translate"] == "bank", "上下文请求丢失待翻译词")
+        try expect(
+            contextualPayload?["context_before"] == "She deposited the cheque at the",
+            "上下文请求丢失前文"
+        )
+        try expect(
+            contextualMessages?.first?["content"]?.contains("只翻译 text_to_translate") == true,
+            "上下文请求未限制模型只翻译选中词"
+        )
+
+        let contextSource = "She deposited the cheque at the bank before it closed."
+        let bankRange = (contextSource as NSString).range(of: "bank")
+        let nearbyContext = SelectionContextPolicy.context(
+            in: contextSource,
+            selectionRange: bankRange,
+            selectedText: "bank"
+        )
+        try expect(nearbyContext?.before == "She deposited the cheque at the", "未正确截取前文")
+        try expect(nearbyContext?.after == "before it closed.", "未正确截取后文")
+        try expect(
+            SelectionContextPolicy.context(
+                in: contextSource,
+                selectionRange: NSRange(location: 0, length: contextSource.utf16.count),
+                selectedText: contextSource
+            ) == nil,
+            "长句不应额外读取上下文"
+        )
+
         let glmSettings = AppSettingsSnapshot(
             baseURL: "https://example.com/v1",
             model: "glm-5.2",
